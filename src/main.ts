@@ -1,22 +1,52 @@
-import { Notice, Plugin, PluginSettingTab, Setting, type App, type Editor } from 'obsidian';
+import {
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  requestUrl,
+  type App,
+  type Editor,
+} from 'obsidian';
 
+import {
+  buildSlackAuthorizeUrl,
+  completeSlackAuth,
+  createPkcePair,
+  refreshSlackSession,
+  type SlackApiFormRequest,
+} from './slack/auth';
 import { TtlCache } from './slack/cache';
 import { detectCandidates } from './slack/detector';
 import { planSlackLinkReplacements } from './slack/engine';
 import { buildTargetUrl } from './slack/renderer';
 import { createResolver } from './slack/resolver';
 import { applyReplacements } from './slack/replacements';
+import { createElectronSessionCipher } from './slack/secure-session';
 import { createSlackService, type SlackService } from './slack/service';
-import type { SlackBasesSettings } from './settings';
-import { DEFAULT_SETTINGS, mergeSettings } from './settings';
+import { hasValidAccessToken, shouldRefreshSession } from './slack/session';
+import { SingleFlight } from './slack/single-flight';
 import type { SlackChannel, SlackUser } from './slack/types';
+import type { SlackBasesSettings } from './settings';
+import {
+  createPersistedSettings,
+  DEFAULT_SETTINGS,
+  loadSettingsWithSession,
+  mergeSettings,
+} from './settings';
+
+const AUTH_CALLBACK_ACTION = 'slack-bases-auth';
+const AUTH_RECONNECT_NOTICE_MS = 60_000;
 
 export default class SlackBasesPlugin extends Plugin {
   private channelCache = new TtlCache<SlackChannel>(DEFAULT_SETTINGS.channelCacheTtlMs);
   private failedLookupCache = new TtlCache<boolean>(DEFAULT_SETTINGS.failedLookupTtlMs);
   private isApplyingChanges = false;
+  private lastAuthNoticeAt = 0;
+  private pendingAuthState: { codeVerifier: string; state: string } | null = null;
   private refreshTimer: number | null = null;
+  private refreshSessionGate = new SingleFlight<boolean>();
   private service: SlackService = createSlackService(DEFAULT_SETTINGS.session);
+  private sessionCipher = createElectronSessionCipher();
   private settings: SlackBasesSettings = DEFAULT_SETTINGS;
   private userCache = new TtlCache<SlackUser>(DEFAULT_SETTINGS.userCacheTtlMs);
   private resolver = createResolver({
@@ -30,6 +60,13 @@ export default class SlackBasesPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
+    this.registerObsidianProtocolHandler(AUTH_CALLBACK_ACTION, (params) => {
+      void this.completeSlackConnect(params);
+    });
+
+    this.addRibbonIcon('link', 'Connect Slack', () => {
+      void this.connectSlack();
+    });
     this.addSettingTab(new SlackBasesSettingTab(this.app, this));
     this.registerCommands();
     this.registerEditorListener();
@@ -43,8 +80,10 @@ export default class SlackBasesPlugin extends Plugin {
   }
 
   async saveSettings(nextSettings?: Partial<SlackBasesSettings>): Promise<void> {
-    this.settings = mergeSettings(nextSettings ? { ...this.settings, ...nextSettings } : this.settings);
-    await this.saveData(this.settings);
+    const mergedSettings = mergeSettings(nextSettings ? { ...this.settings, ...nextSettings } : this.settings);
+
+    this.settings = mergedSettings;
+    await this.saveData(createPersistedSettings(mergedSettings, this.sessionCipher));
     this.rebuildRuntime();
   }
 
@@ -52,14 +91,44 @@ export default class SlackBasesPlugin extends Plugin {
     return this.settings;
   }
 
+  async connectSlack(): Promise<void> {
+    if (!this.settings.clientId) {
+      new Notice('Set your Slack client ID before connecting.');
+      return;
+    }
+
+    if (!this.sessionCipher?.isAvailable()) {
+      new Notice('Secure local storage is unavailable in this desktop environment.');
+      return;
+    }
+
+    const pkcePair = await createPkcePair();
+    const state = this.createStateToken();
+
+    this.pendingAuthState = {
+      codeVerifier: pkcePair.codeVerifier,
+      state,
+    };
+
+    window.open(
+      buildSlackAuthorizeUrl({
+        clientId: this.settings.clientId,
+        codeChallenge: pkcePair.codeChallenge,
+        redirectUri: this.getRedirectUri(),
+        scopes: this.settings.scopes,
+        state,
+      }),
+      '_blank'
+    );
+
+    new Notice('Finish Slack sign-in in your browser, then return to Obsidian.');
+  }
+
   async disconnectSlack(): Promise<void> {
     await this.saveSettings({
+      encryptedSession: '',
       session: {
-        accessToken: '',
-        expiresAt: 0,
-        refreshToken: '',
-        teamId: '',
-        workspace: '',
+        ...DEFAULT_SETTINGS.session,
       },
     });
   }
@@ -75,7 +144,7 @@ export default class SlackBasesPlugin extends Plugin {
   }
 
   showConnectionStatus(): void {
-    if (this.settings.session.accessToken && this.settings.session.workspace) {
+    if (hasValidAccessToken(this.settings.session) && this.settings.session.workspace) {
       new Notice(`Slack session configured for ${this.settings.session.workspace}`);
       return;
     }
@@ -84,7 +153,7 @@ export default class SlackBasesPlugin extends Plugin {
   }
 
   private async loadSettings(): Promise<void> {
-    this.settings = mergeSettings(await this.loadData());
+    this.settings = loadSettingsWithSession(await this.loadData(), this.sessionCipher);
     this.rebuildRuntime();
   }
 
@@ -107,6 +176,22 @@ export default class SlackBasesPlugin extends Plugin {
   }
 
   private registerCommands(): void {
+    this.addCommand({
+      id: 'connect-slack',
+      name: 'Connect Slack',
+      callback: () => {
+        void this.connectSlack();
+      },
+    });
+
+    this.addCommand({
+      id: 'disconnect-slack',
+      name: 'Disconnect Slack',
+      callback: () => {
+        void this.disconnectSlack();
+      },
+    });
+
     this.addCommand({
       id: 'test-slack-connection',
       name: 'Test Slack connection',
@@ -180,6 +265,17 @@ export default class SlackBasesPlugin extends Plugin {
   private async refreshEditor(editor: Editor): Promise<void> {
     const source = editor.getValue();
     const cursorOffset = editor.posToOffset(editor.getCursor());
+    const candidates = detectCandidates(source, { cursorOffset });
+
+    if (!candidates.length) {
+      return;
+    }
+
+    if (!(await this.ensureValidSession())) {
+      this.maybeShowReconnectNotice();
+      return;
+    }
+
     const replacements = await planSlackLinkReplacements(source, {
       cursorOffset,
       resolver: this.resolver,
@@ -217,6 +313,10 @@ export default class SlackBasesPlugin extends Plugin {
       return;
     }
 
+    if (!(await this.ensureValidSession(true))) {
+      return;
+    }
+
     const replacements = await planSlackLinkReplacements(selection, {
       cursorOffset: -1,
       resolver: this.resolver,
@@ -243,6 +343,10 @@ export default class SlackBasesPlugin extends Plugin {
 
     if (!candidate) {
       new Notice('No Slack reference under the cursor.');
+      return;
+    }
+
+    if (!(await this.ensureValidSession(true))) {
       return;
     }
 
@@ -279,6 +383,129 @@ export default class SlackBasesPlugin extends Plugin {
 
     window.open(`slack://user?team=${resolved.teamId}&id=${resolved.userId}`, '_blank');
   }
+
+  private async completeSlackConnect(params: Record<string, string>): Promise<void> {
+    if (params.error) {
+      new Notice(`Slack sign-in failed: ${params.error}`);
+      this.pendingAuthState = null;
+      return;
+    }
+
+    if (!params.code || !params.state || !this.pendingAuthState) {
+      this.pendingAuthState = null;
+      new Notice('Slack sign-in callback was incomplete.');
+      return;
+    }
+
+    if (params.state !== this.pendingAuthState.state) {
+      this.pendingAuthState = null;
+      new Notice('Slack sign-in state did not match the pending request.');
+      return;
+    }
+
+    try {
+      const session = await completeSlackAuth(this.requestSlackApiForm.bind(this), {
+        clientId: this.settings.clientId,
+        code: params.code,
+        codeVerifier: this.pendingAuthState.codeVerifier,
+        redirectUri: this.getRedirectUri(),
+      });
+
+      await this.saveSettings({ session });
+      this.pendingAuthState = null;
+      new Notice(`Connected Slack workspace ${session.workspace || session.teamId}.`);
+    } catch (error) {
+      this.pendingAuthState = null;
+      new Notice(`Slack sign-in failed: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private async ensureValidSession(notifyOnMissing = false): Promise<boolean> {
+    if (!hasValidAccessToken(this.settings.session)) {
+      if (notifyOnMissing) {
+        new Notice('Connect Slack to resolve live Slack metadata.');
+      }
+      return false;
+    }
+
+    if (!shouldRefreshSession(this.settings.session, this.settings.refreshLeewayMs)) {
+      return true;
+    }
+
+    if (!this.settings.clientId || !this.settings.session.refreshToken) {
+      if (notifyOnMissing) {
+        new Notice('Slack session expired. Reconnect Slack.');
+      }
+      return false;
+    }
+
+    return this.refreshSessionGate.run(async () => {
+      if (!shouldRefreshSession(this.settings.session, this.settings.refreshLeewayMs)) {
+        return hasValidAccessToken(this.settings.session);
+      }
+
+      try {
+        const session = await refreshSlackSession(this.requestSlackApiForm.bind(this), {
+          clientId: this.settings.clientId,
+          session: this.settings.session,
+        });
+
+        await this.saveSettings({ session });
+        return true;
+      } catch (error) {
+        if (notifyOnMissing) {
+          new Notice(`Slack session refresh failed: ${getErrorMessage(error)}`);
+        }
+        return false;
+      }
+    });
+  }
+
+  private getRedirectUri(): string {
+    return `obsidian://${AUTH_CALLBACK_ACTION}`;
+  }
+
+  private maybeShowReconnectNotice(): void {
+    if (Date.now() - this.lastAuthNoticeAt < AUTH_RECONNECT_NOTICE_MS) {
+      return;
+    }
+
+    this.lastAuthNoticeAt = Date.now();
+    new Notice('Slack references detected. Connect Slack to enable live resolution.');
+  }
+
+  private createStateToken(): string {
+    return Buffer.from(crypto.getRandomValues(new Uint8Array(16)))
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+  }
+
+  private async requestSlackApiForm(request: SlackApiFormRequest): Promise<any> {
+    const response = await requestUrl({
+      body: request.body.toString(),
+      contentType: 'application/x-www-form-urlencoded; charset=utf-8',
+      headers: request.token
+        ? {
+            Authorization: `Bearer ${request.token}`,
+          }
+        : {},
+      method: 'POST',
+      throw: false,
+      url: `https://slack.com/api/${request.path}`,
+    });
+
+    if (response.status >= 400) {
+      throw new Error(`Slack API request failed: ${response.status}`);
+    }
+
+    if (!response.json?.ok) {
+      throw new Error(response.json?.error ?? `Slack API request failed: ${request.path}`);
+    }
+
+    return response.json;
+  }
 }
 
 class SlackBasesSettingTab extends PluginSettingTab {
@@ -295,36 +522,28 @@ class SlackBasesSettingTab extends PluginSettingTab {
     containerEl.createEl('h2', { text: 'Slack Bases' });
 
     new Setting(containerEl)
-      .setName('Workspace slug')
-      .setDesc('Used for permalink fallback rendering and session metadata.')
-      .addText((text) =>
-        text.setValue(settings.session.workspace).onChange(async (value) => {
-          await this.plugin.saveSettings({
-            session: {
-              ...this.plugin.getSettings().session,
-              workspace: value.trim(),
-            },
-          });
+      .setName('Slack connection')
+      .setDesc(
+        hasValidAccessToken(settings.session)
+          ? `Connected to ${settings.session.workspace || settings.session.teamId}.`
+          : 'Not connected.'
+      )
+      .addButton((button) =>
+        button.setButtonText('Connect').onClick(async () => {
+          await this.plugin.connectSlack();
         })
-      );
-
-    new Setting(containerEl)
-      .setName('Team ID')
-      .setDesc('Used for Slack deep links.')
-      .addText((text) =>
-        text.setValue(settings.session.teamId).onChange(async (value) => {
-          await this.plugin.saveSettings({
-            session: {
-              ...this.plugin.getSettings().session,
-              teamId: value.trim(),
-            },
-          });
+      )
+      .addButton((button) =>
+        button.setButtonText('Disconnect').onClick(async () => {
+          await this.plugin.disconnectSlack();
+          this.display();
+          new Notice('Slack session cleared.');
         })
       );
 
     new Setting(containerEl)
       .setName('Client ID')
-      .setDesc('Slack app client ID for a desktop PKCE flow.')
+      .setDesc('Slack app client ID for the desktop PKCE flow.')
       .addText((text) =>
         text.setValue(settings.clientId).onChange(async (value) => {
           await this.plugin.saveSettings({ clientId: value.trim() });
@@ -332,34 +551,13 @@ class SlackBasesSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Access token')
-      .setDesc('Stored locally for Slack metadata hydration.')
-      .addText((text) => {
-        text.inputEl.type = 'password';
-        text.setValue(settings.session.accessToken ?? '').onChange(async (value) => {
-          await this.plugin.saveSettings({
-            session: {
-              ...this.plugin.getSettings().session,
-              accessToken: value.trim(),
-            },
-          });
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('Refresh token')
-      .setDesc('Optional refresh token for long-lived sessions.')
-      .addText((text) => {
-        text.inputEl.type = 'password';
-        text.setValue(settings.session.refreshToken ?? '').onChange(async (value) => {
-          await this.plugin.saveSettings({
-            session: {
-              ...this.plugin.getSettings().session,
-              refreshToken: value.trim(),
-            },
-          });
-        });
-      });
+      .setName('User scopes')
+      .setDesc('Comma-separated Slack user scopes requested during Connect Slack.')
+      .addTextArea((text) =>
+        text.setValue(settings.scopes).onChange(async (value) => {
+          await this.plugin.saveSettings({ scopes: value.trim() || DEFAULT_SETTINGS.scopes });
+        })
+      );
 
     new Setting(containerEl)
       .setName('Message template')
@@ -398,6 +596,20 @@ class SlackBasesSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName('Refresh leeway')
+      .setDesc('How early the plugin refreshes an expiring Slack session.')
+      .addText((text) =>
+        text.setValue(String(settings.refreshLeewayMs)).onChange(async (value) => {
+          const parsed = Number.parseInt(value, 10);
+          if (Number.isNaN(parsed) || parsed < 0) {
+            return;
+          }
+
+          await this.plugin.saveSettings({ refreshLeewayMs: parsed });
+        })
+      );
+
+    new Setting(containerEl)
       .setName('Auto-link channels')
       .setDesc('Resolve #channel references after the idle delay.')
       .addToggle((toggle) =>
@@ -431,13 +643,10 @@ class SlackBasesSettingTab extends PluginSettingTab {
         button.setButtonText('Test').onClick(() => {
           this.plugin.showConnectionStatus();
         })
-      )
-      .addButton((button) =>
-        button.setButtonText('Disconnect').onClick(async () => {
-          await this.plugin.disconnectSlack();
-          this.display();
-          new Notice('Slack session cleared.');
-        })
       );
   }
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

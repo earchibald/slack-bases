@@ -1,8 +1,14 @@
 import type { LinkTargetPreference, SlackSession } from './slack/types';
+import {
+  decodeSecureSession,
+  encodeSecureSession,
+  type SessionCipher,
+} from './slack/secure-session';
 
 export interface SlackBasesSettings {
   channelCacheTtlMs: number;
   clientId: string;
+  encryptedSession: string;
   enableChannels: boolean;
   enableDmSentinels: boolean;
   enablePermalinks: boolean;
@@ -19,6 +25,7 @@ export interface SlackBasesSettings {
 export const DEFAULT_SETTINGS: SlackBasesSettings = {
   channelCacheTtlMs: 60 * 60 * 1000,
   clientId: '',
+  encryptedSession: '',
   enableChannels: true,
   enableDmSentinels: true,
   enablePermalinks: true,
@@ -49,4 +56,60 @@ export function mergeSettings(
       ...partial?.session,
     },
   };
+}
+
+export function createPersistedSettings(
+  settings: SlackBasesSettings,
+  cipher?: SessionCipher | null
+): SlackBasesSettings {
+  if (!hasSessionData(settings.session)) {
+    return {
+      ...settings,
+      encryptedSession: '',
+      session: { ...DEFAULT_SETTINGS.session },
+    };
+  }
+
+  if (!cipher?.isAvailable()) {
+    return {
+      ...settings,
+      encryptedSession: '',
+      session: { ...DEFAULT_SETTINGS.session },
+    };
+  }
+
+  return {
+    ...settings,
+    encryptedSession: encodeSecureSession(settings.session, cipher),
+    session: { ...DEFAULT_SETTINGS.session },
+  };
+}
+
+export function loadSettingsWithSession(
+  partial: Partial<SlackBasesSettings> | undefined,
+  cipher?: SessionCipher | null
+): SlackBasesSettings {
+  const merged = mergeSettings(partial);
+
+  if (!merged.encryptedSession || !cipher?.isAvailable()) {
+    return merged;
+  }
+
+  return {
+    ...merged,
+    session: {
+      ...DEFAULT_SETTINGS.session,
+      ...decodeSecureSession(merged.encryptedSession, cipher),
+    },
+  };
+}
+
+function hasSessionData(session: SlackSession): boolean {
+  return Boolean(
+    session.accessToken ||
+      session.refreshToken ||
+      session.teamId ||
+      session.workspace ||
+      session.expiresAt
+  );
 }
