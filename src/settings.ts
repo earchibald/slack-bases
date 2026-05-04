@@ -19,6 +19,7 @@ export interface SlackBasesSettings {
   scopes: string;
   session: SlackSession;
   target: LinkTargetPreference;
+  teamId: string;
   userCacheTtlMs: number;
 }
 
@@ -42,8 +43,13 @@ export const DEFAULT_SETTINGS: SlackBasesSettings = {
     workspace: '',
   },
   target: 'app',
+  teamId: '',
   userCacheTtlMs: 60 * 60 * 1000,
 };
+
+export function isValidSlackClientId(value: string): boolean {
+  return /^\d+\.\d+$/.test(value);
+}
 
 export function mergeSettings(
   partial: Partial<SlackBasesSettings> | undefined

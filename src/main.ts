@@ -30,6 +30,7 @@ import type { SlackBasesSettings } from './settings';
 import {
   createPersistedSettings,
   DEFAULT_SETTINGS,
+  isValidSlackClientId,
   loadSettingsWithSession,
   mergeSettings,
 } from './settings';
@@ -97,6 +98,13 @@ export default class SlackBasesPlugin extends Plugin {
       return;
     }
 
+    if (this.settings.clientId && !isValidSlackClientId(this.settings.clientId)) {
+      new Notice(
+        'Invalid Slack client ID "' + this.settings.clientId + '". Expected format: <numbers>.<numbers> (e.g., 1234567890.1234567890).'
+      );
+      return;
+    }
+
     if (!this.sessionCipher?.isAvailable()) {
       new Notice('Secure local storage is unavailable in this desktop environment.');
       return;
@@ -117,11 +125,12 @@ export default class SlackBasesPlugin extends Plugin {
         redirectUri: this.getRedirectUri(),
         scopes: this.settings.scopes,
         state,
+        teamId: this.settings.teamId || undefined,
       }),
       '_blank'
     );
 
-    new Notice('Finish Slack sign-in in your browser, then return to Obsidian.');
+    new Notice('Authorize the Slack app in your browser, then return to Obsidian.');
   }
 
   async disconnectSlack(): Promise<void> {
@@ -416,7 +425,19 @@ export default class SlackBasesPlugin extends Plugin {
       new Notice(`Connected Slack workspace ${session.workspace || session.teamId}.`);
     } catch (error) {
       this.pendingAuthState = null;
-      new Notice(`Slack sign-in failed: ${getErrorMessage(error)}`);
+      const message = getErrorMessage(error);
+      const advice = message.includes('invalid_client')
+        ? 'Check that your Slack client ID and client secret are correct.'
+        : message.includes('invalid_grant')
+        ? 'The authorization code expired. Try connecting again.'
+        : message.includes('redirect_uri_mismatch')
+        ? 'Add obsidian://slack-bases-auth to your Slack app redirect URLs.'
+        : message.includes('invalid_client_id')
+        ? 'The Slack client ID appears invalid. Check your Slack app settings.'
+        : '';
+      new Notice(
+        `Slack sign-in failed: ${message}${advice ? ' ' + advice : ''}`
+      );
     }
   }
 
@@ -501,7 +522,11 @@ export default class SlackBasesPlugin extends Plugin {
     }
 
     if (!response.json?.ok) {
-      throw new Error(response.json?.error ?? `Slack API request failed: ${request.path}`);
+      throw new Error(
+        response.json?.error
+          ? `Slack API error: ${response.json.error}`
+          : `Slack API request failed: ${request.path}`
+      );
     }
 
     return response.json;
