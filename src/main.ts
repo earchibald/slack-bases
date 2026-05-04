@@ -568,7 +568,7 @@ class SlackBasesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Client ID')
-      .setDesc('Slack app client ID for the desktop PKCE flow.')
+      .setDesc('Find this in your Slack app settings (api.slack.com/apps) under Basic Information → App Credentials → Client ID. Format: <numbers>.<numbers> (e.g., 1234567890.1234567890).')
       .addText((text) =>
         text.setValue(settings.clientId).onChange(async (value) => {
           await this.plugin.saveSettings({ clientId: value.trim() });
