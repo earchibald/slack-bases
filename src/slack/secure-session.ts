@@ -45,10 +45,26 @@ function getElectronSafeStorage(): ElectronSafeStorage | null {
     return null;
   }
 
+  let electron: { safeStorage?: ElectronSafeStorage; remote?: { safeStorage?: ElectronSafeStorage } } = {};
+
   try {
-    const electron = requireFn('electron') as { safeStorage?: ElectronSafeStorage };
-    return electron.safeStorage ?? null;
+    electron = requireFn('electron') as typeof electron;
   } catch {
     return null;
   }
+
+  if (electron.remote?.safeStorage) {
+    return electron.remote.safeStorage;
+  }
+
+  try {
+    const electronRemote = requireFn('@electron/remote') as { safeStorage?: ElectronSafeStorage };
+    if (electronRemote.safeStorage) {
+      return electronRemote.safeStorage;
+    }
+  } catch {
+    // @electron/remote not available — fall through.
+  }
+
+  return electron.safeStorage ?? null;
 }
