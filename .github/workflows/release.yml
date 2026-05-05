@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+# Default to read-only; the release job explicitly escalates to write.
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # ── Build ────────────────────────────────────────────────────────────────
+  # Runs with read-only repo access so that `npm ci` (and any postinstall
+  # scripts) cannot write to the repository.
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      skip:       ${{ steps.guard.outputs.skip }}
+      tag_exists: ${{ steps.guard.outputs.tag_exists }}
+      tag:        ${{ steps.version.outputs.tag }}
+      version:    ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Shallow checkout is sufficient — `--generate-notes` is resolved
+          # server-side by the GitHub API, not from local history.
+          fetch-depth: 1
+          fetch-tags: true
+
+      - name: Read manifest version
+        id: version
+        run: |
+          version=$(jq -r .version manifest.json)
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "ERROR: could not read a valid version from manifest.json" >&2
+            exit 1
+          fi
+          # Bare semver tag — no `v` prefix.
+          # BRAT and the Obsidian community-plugin installer both accept bare
+          # semver (e.g. 1.2.3) and v-prefixed (v1.2.3); bare semver is the
+          # predominant convention in the community plugin registry and is
+          # used here intentionally for consistency with other plugins.
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$version"     >> "$GITHUB_OUTPUT"
+
+      - name: Check tag and release existence
+        id: guard
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Re-fetch tags here so we catch any tag pushed by a concurrent run
+          # that finished after our initial checkout but before this check.
+          git fetch --tags
+
+          TAG_EXISTS=false
+          RELEASE_EXISTS=false
+
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            TAG_EXISTS=true
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+          fi
+
+          if [[ "$TAG_EXISTS" == "true" && "$RELEASE_EXISTS" == "true" ]]; then
+            echo "Tag and release $TAG already exist; nothing to release."
+            echo "skip=true"            >> "$GITHUB_OUTPUT"
+            echo "tag_exists=true"      >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG_EXISTS" == "true" && "$RELEASE_EXISTS" == "false" ]]; then
+            echo "Tag $TAG exists but release is missing; will create release only."
+            echo "skip=false"           >> "$GITHUB_OUTPUT"
+            echo "tag_exists=true"      >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false"           >> "$GITHUB_OUTPUT"
+            echo "tag_exists=false"     >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          node-version: "20"
+
+      - name: Install
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          if ! npm ci; then
+            {
+              echo "## ❌ \`npm ci\` failed"
+              echo ""
+              echo "**Possible causes:** stale lockfile, npm registry outage,"
+              echo "or a peer-dependency conflict."
+              echo ""
+              echo "If the lockfile is out of sync, run \`npm install\` locally"
+              echo "and commit the updated \`package-lock.json\` before merging."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Build
+        if: steps.guard.outputs.skip == 'false'
+        run: npm run build
+
+      - name: Verify build output
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          test -f main.js || {
+            echo "ERROR: main.js not found after build — check esbuild.config.mjs outfile path" >&2
+            exit 1
+          }
+
+      - name: Upload release assets
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            main.js
+            manifest.json
+
+  # ── Release ──────────────────────────────────────────────────────────────
+  # Runs only when the build job signals work to do.  Elevated write
+  # permissions are scoped to this job only, keeping them away from npm ci.
+  release:
+    needs: build
+    if: needs.build.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          fetch-tags: true
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+
+      - name: Create and push tag
+        if: needs.build.outputs.tag_exists == 'false'
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          gh release create "$TAG" \
+            --title "Slack Bases v$VERSION" \
+            --generate-notes \
+            main.js \
+            manifest.json
