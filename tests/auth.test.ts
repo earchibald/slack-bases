@@ -27,6 +27,22 @@ describe('buildSlackAuthorizeUrl', () => {
     expect(url.searchParams.get('response_type')).toBe('code');
     expect(url.searchParams.get('state')).toBe('state-token');
     expect(url.searchParams.get('user_scope')).toBe('channels:read,users:read');
+    expect(url.searchParams.get('team')).toBeNull();
+  });
+
+  it('includes the team param when teamId is provided', () => {
+    const url = new URL(
+      buildSlackAuthorizeUrl({
+        clientId: '123.456',
+        codeChallenge: 'challenge',
+        redirectUri: 'obsidian://slack-bases-auth',
+        scopes: 'channels:read,users:read',
+        state: 'state-token',
+        teamId: 'T01234567',
+      })
+    );
+
+    expect(url.searchParams.get('team')).toBe('T01234567');
   });
 });
 

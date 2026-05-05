@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SETTINGS,
   createPersistedSettings,
+  isValidSlackClientId,
   loadSettingsWithSession,
   mergeSettings,
 } from '../src/settings';
@@ -36,6 +37,32 @@ describe('mergeSettings', () => {
         workspace: 'acme',
       },
     });
+  });
+});
+
+describe('isValidSlackClientId', () => {
+  it('accepts a well-formed Slack client ID', () => {
+    expect(isValidSlackClientId('1234567890.1234567890')).toBe(true);
+  });
+
+  it('rejects an empty string', () => {
+    expect(isValidSlackClientId('')).toBe(false);
+  });
+
+  it('rejects a string without a dot', () => {
+    expect(isValidSlackClientId('1234567890')).toBe(false);
+  });
+
+  it('rejects a string with trailing text', () => {
+    expect(isValidSlackClientId('123.456abc')).toBe(false);
+  });
+
+  it('rejects a string with leading text', () => {
+    expect(isValidSlackClientId('abc123.456')).toBe(false);
+  });
+
+  it('rejects a string with spaces', () => {
+    expect(isValidSlackClientId('123. 456')).toBe(false);
   });
 });
 

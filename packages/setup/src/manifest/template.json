@@ -1,0 +1,27 @@
+{
+  "display_information": {
+    "name": "Slack Bases",
+    "description": "Slack smart links for Obsidian",
+    "background_color": "#4A154B"
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "obsidian://slack-bases-auth"
+    ],
+    "scopes": {
+      "user": [
+        "channels:read",
+        "groups:read",
+        "users:read",
+        "users:read.email",
+        "channels:history",
+        "groups:history"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

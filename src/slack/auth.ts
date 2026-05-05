@@ -14,6 +14,7 @@ export function buildSlackAuthorizeUrl(input: {
   redirectUri: string;
   scopes: string;
   state: string;
+  teamId?: string;
 }): string {
   const url = new URL('https://slack.com/oauth/v2/authorize');
 
@@ -24,6 +25,10 @@ export function buildSlackAuthorizeUrl(input: {
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('state', input.state);
   url.searchParams.set('user_scope', input.scopes);
+
+  if (input.teamId) {
+    url.searchParams.set('team', input.teamId);
+  }
 
   return url.toString();
 }

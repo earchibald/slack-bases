@@ -1,7 +1,7 @@
 {
   "id": "slack-bases",
   "name": "Slack Bases",
-  "version": "0.2.1",
+  "version": "0.1.0",
   "minAppVersion": "1.5.0",
   "description": "Turn Slack references into smart links.",
   "author": "Copilot",
