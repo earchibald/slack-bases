@@ -1,0 +1,23 @@
+{
+  "name": "@slack-bases/setup",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "slack-bases-setup": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
