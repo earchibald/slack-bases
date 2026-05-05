@@ -22,7 +22,7 @@ export function getTemplate(): Record<string, unknown> {
 
 function makeApi(token: string): ApiFn {
   const client = new WebClient(token);
-  return (method, args) => client.apiCall(method, args) as Promise<Record<string, unknown>>;
+  return (method, args) => client.apiCall(method, args) as unknown as Promise<Record<string, unknown>>;
 }
 
 export async function createApp(opts: { token: string; api?: ApiFn }): Promise<CreateResult> {

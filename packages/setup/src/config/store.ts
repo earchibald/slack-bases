@@ -42,7 +42,7 @@ export function readConfig(io?: ConfigIO): AppConfig | null {
   for (const field of REQUIRED_FIELDS) {
     if (parsed[field] === undefined || parsed[field] === null) return null;
   }
-  return parsed as AppConfig;
+  return parsed as unknown as AppConfig;
 }
 
 function defaultReadFile(path: string): string {
