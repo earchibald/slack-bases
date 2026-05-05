@@ -64,6 +64,22 @@ async function main() {
       });
       break;
     case 'update':
+      await updateCommand({
+        token: (flags.token as string) ?? null,
+        force: !!flags.force,
+        prompts: {
+          confirmApply: async () => {
+            const rl = (await import('node:readline')).createInterface({ input: process.stdin, output: process.stdout });
+            return new Promise((resolve) => {
+              rl.question('Apply these changes? (y/N): ', (answer) => {
+                rl.close();
+                resolve(answer.toLowerCase() === 'y');
+              });
+            });
+          },
+        },
+      });
+      break;
     case 'help':
     case '':
       console.log(`
