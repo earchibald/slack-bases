@@ -1,7 +1,7 @@
 import { resolveToken } from '../token/provider.js';
 import { readConfig, writeConfig, CONFIG_DIR, TOKEN_PATH } from '../config/store.js';
 import { createApp, getTemplate } from '../manifest/manager.js';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 export interface InitOptions {
@@ -26,6 +26,14 @@ async function createWithNameRetry(
 ): Promise<{ app_id: string; client_id: string; team_id: string }> {
   const template = getTemplate();
   let lastError: string | null = null;
+
+  // First, try the original template name
+  try {
+    return await createFn(template);
+  } catch (err) {
+    lastError = String(err);
+    if (!lastError.includes('name_taken')) throw err;
+  }
 
   // Counter suffixes 2-20
   for (let i = 2; i <= 20; i++) {
@@ -144,8 +152,9 @@ export async function initCommand(opts: InitOptions): Promise<void> {
   mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   writeConfig(config, { writeFile });
 
-  if (opts.saveToken && writeFile) {
-    writeFile(TOKEN_PATH, resolvedToken);
+  if (opts.saveToken) {
+    const save = writeFile ?? ((path: string, content: string) => writeFileSync(path, content, { mode: 0o600 }));
+    save(TOKEN_PATH, resolvedToken);
     console.log('Token saved to ~/.config/slack-bases/token');
   }
 
