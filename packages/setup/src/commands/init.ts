@@ -20,6 +20,57 @@ function sha256(obj: Record<string, unknown>): string {
   return createHash('sha256').update(JSON.stringify(obj)).digest('hex');
 }
 
+async function createWithNameRetry(
+  createFn: (manifest: Record<string, unknown>) => Promise<{ app_id: string; client_id: string; team_id: string }>,
+  opts: { promptName?: () => Promise<string | null> }
+): Promise<{ app_id: string; client_id: string; team_id: string }> {
+  const template = getTemplate();
+  let lastError: string | null = null;
+
+  // Counter suffixes 2-20
+  for (let i = 2; i <= 20; i++) {
+    const displayInfo = template.display_information as Record<string, unknown> ?? {};
+    const candidate = { ...template, display_information: { ...displayInfo, name: `Slack Bases (${i})` } };
+    try {
+      return await createFn(candidate);
+    } catch (err) {
+      lastError = String(err);
+      if (!lastError.includes('name_taken')) throw err;
+    }
+  }
+
+  // User-provided name (up to 5 retries)
+  if (opts.promptName) {
+    for (let i = 0; i < 5; i++) {
+      const customName = await opts.promptName();
+      if (!customName) break;
+      if (!/^[a-zA-Z0-9 -]{1,80}$/.test(customName)) {
+        console.error('Invalid name. Use letters, numbers, hyphens, and spaces only (1-80 characters).');
+        continue;
+      }
+      const displayInfo = template.display_information as Record<string, unknown> ?? {};
+      const candidate = { ...template, display_information: { ...displayInfo, name: customName } };
+      try {
+        return await createFn(candidate);
+      } catch (err) {
+        lastError = String(err);
+        if (!lastError.includes('name_taken')) throw err;
+        console.error(`"${customName}" is also taken. Try another.`);
+      }
+    }
+  }
+
+  // Random suffix fallback
+  const suffix = Math.random().toString(16).slice(2, 6);
+  const displayInfo = template.display_information as Record<string, unknown> ?? {};
+  const fallback = { ...template, display_information: { ...displayInfo, name: `Slack Bases - ${suffix}` } };
+  try {
+    return await createFn(fallback);
+  } catch (err) {
+    throw new Error('Could not create app: all names exhausted. Choose a name manually at api.slack.com/apps.');
+  }
+}
+
 export async function initCommand(opts: InitOptions): Promise<void> {
   const readFile = opts.readFile;
   const writeFile = opts.writeFile;
@@ -52,7 +103,20 @@ export async function initCommand(opts: InitOptions): Promise<void> {
 
   let result;
   try {
-    result = await createApp({ token: resolvedToken });
+    result = await createWithNameRetry(
+      async (m) => createApp({ token: resolvedToken, manifest: m }),
+      {
+        promptName: async () => {
+          const rl = (await import('node:readline')).createInterface({ input: process.stdin, output: process.stdout });
+          return new Promise((resolve) => {
+            rl.question('Enter a different app name (or press Enter to use a random suffix): ', (answer) => {
+              rl.close();
+              resolve(answer.trim() || null);
+            });
+          });
+        },
+      }
+    );
   } catch (err) {
     const msg = String(err);
     if (msg.includes('invalid_auth') || msg.includes('not_authed') || msg.includes('not_allowed_token_type')) {

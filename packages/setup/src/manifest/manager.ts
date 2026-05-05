@@ -25,9 +25,9 @@ function makeApi(token: string): ApiFn {
   return (method, args) => client.apiCall(method, args) as unknown as Promise<Record<string, unknown>>;
 }
 
-export async function createApp(opts: { token: string; api?: ApiFn }): Promise<CreateResult> {
+export async function createApp(opts: { token: string; manifest?: Record<string, unknown>; api?: ApiFn }): Promise<CreateResult> {
   const api = opts.api ?? makeApi(opts.token);
-  const manifest = getTemplate();
+  const manifest = opts.manifest ?? getTemplate();
   const response = await api('apps.manifest.create', { manifest });
   if (!response.ok) throw new Error(String(response.error ?? 'create failed'));
   const creds = response.credentials as Record<string, string> | undefined;
