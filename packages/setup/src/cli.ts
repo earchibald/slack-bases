@@ -57,9 +57,13 @@ async function main() {
       break;
     }
     case 'status':
-    case 'update':
-      console.log(`Command '${command}' not yet wired — coming in next tasks.`);
+      await statusCommand({
+        token: (flags.token as string) ?? null,
+        json: !!flags.json,
+        manifest: !!flags.manifest,
+      });
       break;
+    case 'update':
     case 'help':
     case '':
       console.log(`
